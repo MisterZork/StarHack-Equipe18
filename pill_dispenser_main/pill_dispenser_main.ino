@@ -16,11 +16,11 @@
 #include <LiquidCrystal.h>
 #include <DS3231.h>
 #include <Stepper.h>
-#include <dht_nonblocking.h>  // Non-blocking DHT library
+#include <DHT.h>  // Adafruit DHT library - more reliable!
 #include "pitches.h"
 
-// DHT sensor type for non-blocking library
-#define DHT_SENSOR_TYPE DHT_TYPE_11  // or DHT_TYPE_22 if you have DHT22
+// DHT sensor type
+#define DHT_TYPE DHT11  // Change to DHT22 if you have that one
 
 // ==================== PIN DEFINITIONS ====================
 // LCD (Parallel connection - 4-bit mode)
@@ -48,9 +48,9 @@
 
 // ==================== COMPONENT INITIALIZATION ====================
 LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
-DS3231 rtc;  // RTC object - uses I2C automatically
+DS3231 rtc;
 Stepper stepper(2048, STEPPER_IN1, STEPPER_IN3, STEPPER_IN2, STEPPER_IN4);
-DHT_nonblocking dht(DHT_PIN, DHT_SENSOR_TYPE);  // Non-blocking DHT
+DHT dht(DHT_PIN, DHT_TYPE);  // Adafruit DHT
 
 // ==================== CONSTANTS ====================
 // Temperature and humidity thresholds
@@ -76,7 +76,7 @@ const unsigned long MEDICATION_CHECK_INTERVAL = 10000;  // Check for medication 
 // Medication schedule (24-hour format: HH.mm as decimal)
 // Example: 9.5 = 9:30, 13.75 = 13:45
 // SET ONE TIME TO ~1 MINUTE FROM NOW FOR TESTING!
-const float MED_TIMES[] = {9.87, 11.89, 11.9, 18};  // 13:44, 14:00, 18:00, 21:28
+const float MED_TIMES[] = {9.86, 11.8, 11.9, 18};  // 13:44, 14:00, 18:00, 21:28
 const int NUM_MED_TIMES = 4;  // Number of medication times
 
 // ==================== STATE VARIABLES ====================
@@ -170,7 +170,10 @@ void setup() {
   Serial.print(dt.minute);
   Serial.print(":");
   Serial.println(dt.second);
-  Serial.println(dt.second);
+  
+  // Initialize DHT sensor
+  dht.begin();
+  Serial.println("DHT sensor initialized on pin 22");
   
   // Initialize pins
   pinMode(BUZZER_PIN, OUTPUT);
@@ -202,38 +205,59 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
   
-  // IMPORTANT: Call DHT measure() EVERY loop for non-blocking to work!
-  float newTemp, newHum;
-  if (dht.measure(&newTemp, &newHum)) {
-    // Reading successful!
-    temperature = newTemp;
-    humidity = newHum;
-    dhtWorking = true;
-    Serial.print("DHT OK - ");
-    Serial.print(temperature);
-    Serial.print("C, ");
-    Serial.print(humidity);
-    Serial.println("%");
+  // Read DHT every 2 seconds (Adafruit library needs time between reads)
+  static unsigned long lastDHTRead = 0;
+  if (currentTime - lastDHTRead >= 2000) {
+    float newTemp = dht.readTemperature();
+    float newHum = dht.readHumidity();
+    
+    if (!isnan(newTemp) && !isnan(newHum)) {
+      temperature = newTemp;
+      humidity = newHum;
+      dhtWorking = true;
+      Serial.print("DHT: ");
+      Serial.print(temperature);
+      Serial.print("C, ");
+      Serial.print(humidity);
+      Serial.println("%");
+    } else {
+      Serial.println("DHT read failed!");
+    }
+    lastDHTRead = currentTime;
   }
   
-  // Read touch sensor every loop
+  // Read touch sensor
   int sensorValue = analogRead(WATER_SENSOR_PIN);
   touchDetected = (sensorValue > TOUCH_THRESHOLD);
   
-  // Check warnings periodically
+  // Check warning conditions EVERY loop (not just periodically)
+  // This ensures buzzer starts immediately when pills dispensed
+  if (pillsReady && !touchDetected) {
+    currentWarning = PILLS_READY_WARNING;
+  } else if (!tempHumidityOK) {
+    currentWarning = TEMP_HUMIDITY_WARNING;
+  } else {
+    currentWarning = NO_WARNING;
+  }
+  
+  // Update other things periodically
   if (currentTime - lastWarningCheck >= WARNING_CHECK_INTERVAL) {
-    checkWarningConditions();
+    // Check DHT thresholds
+    if (dhtWorking) {
+      tempHumidityOK = (temperature >= TEMP_MIN && temperature <= TEMP_MAX &&
+                        humidity >= HUMIDITY_MIN && humidity <= HUMIDITY_MAX);
+    }
     updateNextMedTime();
     lastWarningCheck = currentTime;
   }
   
-  // Cycle display between temp/humidity and date
+  // Cycle display
   if (currentTime - lastDisplayCycle >= DISPLAY_CYCLE_INTERVAL) {
     showDate = !showDate;
     lastDisplayCycle = currentTime;
   }
   
-  // Check if it's time for medication
+  // Check medication time
   if (currentTime - lastMedicationCheck >= MEDICATION_CHECK_INTERVAL) {
     checkMedicationTime();
     lastMedicationCheck = currentTime;
@@ -245,18 +269,12 @@ void loop() {
   // Handle warnings
   handleWarnings(currentTime);
   
-  // Check for serial commands
+  // Serial commands
   if (Serial.available() > 0) {
     char cmd = Serial.read();
-    if (cmd == 'D' || cmd == 'd') {
-      dispensePill();
-    }
-    else if (cmd == 'T' || cmd == 't') {
-      testMotor();
-    }
-    else if (cmd == 'M' || cmd == 'm') {
-      showNextMedTime();
-    }
+    if (cmd == 'D' || cmd == 'd') dispensePill();
+    else if (cmd == 'T' || cmd == 't') testMotor();
+    else if (cmd == 'M' || cmd == 'm') showNextMedTime();
   }
   
   delay(50);
@@ -418,16 +436,23 @@ void dispensePill() {
   lcd.print("Dispensing...");
   
   // Move stepper motor
-  stepper.step(STEPS_PER_PILL);  // Positive for clockwise
+  stepper.step(STEPS_PER_PILL);
   
-  // Set pills ready flag
+  // Set pills ready flag - THIS TRIGGERS THE BUZZER!
   pillsReady = true;
+  currentWarning = PILLS_READY_WARNING;  // Force warning state immediately
+  
+  Serial.println("Pills dispensed! Buzzer should be ON now.");
+  Serial.println("Touch water sensor to stop buzzer.");
   
   lcd.clear();
   lcd.print("Pills Ready!");
-  Serial.println("Pills dispensed!");
   
-  delay(1000);
+  // Start buzzer immediately
+  tone(BUZZER_PIN, NOTE_E5);
+  digitalWrite(LED_PIN, HIGH);
+  
+  delay(500);
 }
 
 // ==================== RTC FUNCTIONS ====================
