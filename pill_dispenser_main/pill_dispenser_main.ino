@@ -16,8 +16,11 @@
 #include <LiquidCrystal.h>
 #include <DS3231.h>
 #include <Stepper.h>
-#include <DHT.h>  // Adafruit DHT library
+#include <dht_nonblocking.h>  // Non-blocking DHT library
 #include "pitches.h"
+
+// DHT sensor type for non-blocking library
+#define DHT_SENSOR_TYPE DHT_TYPE_11  // or DHT_TYPE_22 if you have DHT22
 
 // ==================== PIN DEFINITIONS ====================
 // LCD (Parallel connection - 4-bit mode)
@@ -45,9 +48,9 @@
 
 // ==================== COMPONENT INITIALIZATION ====================
 LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
-DS3231 rtc;
+DS3231 rtc;  // RTC object - uses I2C automatically
 Stepper stepper(2048, STEPPER_IN1, STEPPER_IN3, STEPPER_IN2, STEPPER_IN4);
-DHT dht(DHT_PIN, DHT11);  // DHT11 sensor on pin 22
+DHT_nonblocking dht(DHT_PIN, DHT_SENSOR_TYPE);  // Non-blocking DHT
 
 // ==================== CONSTANTS ====================
 // Temperature and humidity thresholds
@@ -68,10 +71,12 @@ const unsigned long BEEP_DURATION = 200;        // ms
 const unsigned long BEEP_PAUSE = 300;           // ms between beeps
 const unsigned long WARNING_CHECK_INTERVAL = 5000;  // Check every 5 seconds
 const unsigned long DISPLAY_CYCLE_INTERVAL = 3000;  // Cycle display every 3 seconds
+const unsigned long MEDICATION_CHECK_INTERVAL = 10000;  // Check for medication time every 10 seconds (was 30)
 
-// Medication schedule (24-hour format: HH)
-// Add your medication times here (up to 8 times per day)
-const float MED_TIMES[] = {8, 12, 18, 22};  // 8am, 12pm, 6pm, 10pm
+// Medication schedule (24-hour format: HH.mm as decimal)
+// Example: 9.5 = 9:30, 13.75 = 13:45
+// SET ONE TIME TO ~1 MINUTE FROM NOW FOR TESTING!
+const float MED_TIMES[] = {9.87, 11.89, 11.9, 18};  // 13:44, 14:00, 18:00, 21:28
 const int NUM_MED_TIMES = 4;  // Number of medication times
 
 // ==================== STATE VARIABLES ====================
@@ -80,11 +85,12 @@ float humidity = 50.0;     // Default humidity
 bool tempHumidityOK = true;
 bool pillsReady = false;
 bool touchDetected = false;
-bool dhtWorking = true;  // Will be set to true if DHT reads successfully
+bool dhtWorking = false;  // Will be set to true if DHT reads successfully
 
 unsigned long lastWarningCheck = 0;
 unsigned long lastBeepTime = 0;
 unsigned long lastDisplayCycle = 0;
+unsigned long lastMedicationCheck = 0;
 int beepCount = 0;
 bool isBeeping = false;
 bool showDate = false;  // Toggle between temp/humidity and date
@@ -92,6 +98,9 @@ bool showDate = false;  // Toggle between temp/humidity and date
 // Next medication time
 int nextMedHour = -1;
 int nextMedMinute = 0;
+
+// Track which medication times have been dispensed today
+bool medicationDispensed[8] = {false, false, false, false, false, false, false, false};
 
 enum WarningState {
   NO_WARNING,
@@ -103,9 +112,11 @@ WarningState currentWarning = NO_WARNING;
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);  // Changed to 115200 for consistency
-  setTimeFromSerial();
   
-  // Initialize I2C
+  Serial.println("StarHack 2026 - Pill Dispenser");
+  Serial.println("Initializing components...");
+  
+  // Initialize I2C FIRST
   Wire.begin();
   
   // Initialize LCD
@@ -117,16 +128,54 @@ void setup() {
   
   // Initialize RTC
   rtc.begin();
-  // UNCOMMENT THE LINE BELOW TO SET TIME, THEN RE-COMMENT AFTER ONE UPLOAD!
-  // rtc.setDateTime(2026, 3, 29, 9, 24, 0);  // Year, Month, Day, Hour, Minute, Second
+  
+  // FORCE SET RTC to compile time every upload
+  // Parse __DATE__ and __TIME__ manually for DS3231
+  // __DATE__ = "Mar 29 2026", __TIME__ = "13:42:09"
+  char monthStr[4];
+  int day, year, hour, minute, second;
+  sscanf(__DATE__, "%s %d %d", monthStr, &day, &year);
+  sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second);
+  
+  // Convert month string to number
+  int month = 1;
+  if (strcmp(monthStr, "Jan") == 0) month = 1;
+  else if (strcmp(monthStr, "Feb") == 0) month = 2;
+  else if (strcmp(monthStr, "Mar") == 0) month = 3;
+  else if (strcmp(monthStr, "Apr") == 0) month = 4;
+  else if (strcmp(monthStr, "May") == 0) month = 5;
+  else if (strcmp(monthStr, "Jun") == 0) month = 6;
+  else if (strcmp(monthStr, "Jul") == 0) month = 7;
+  else if (strcmp(monthStr, "Aug") == 0) month = 8;
+  else if (strcmp(monthStr, "Sep") == 0) month = 9;
+  else if (strcmp(monthStr, "Oct") == 0) month = 10;
+  else if (strcmp(monthStr, "Nov") == 0) month = 11;
+  else if (strcmp(monthStr, "Dec") == 0) month = 12;
+  
+  // Set RTC to compile time
+  rtc.setDateTime(year, month, day, hour, minute, second);
+  Serial.print("RTC set to compile time: ");
+  Serial.print(year); Serial.print("/");
+  Serial.print(month); Serial.print("/");
+  Serial.print(day); Serial.print(" ");
+  Serial.print(hour); Serial.print(":");
+  Serial.print(minute); Serial.print(":");
+  Serial.println(second);
+  
+  // Verify RTC time
+  RTCDateTime dt = rtc.getDateTime();
+  Serial.print("RTC now shows: ");
+  Serial.print(dt.hour);
+  Serial.print(":");
+  Serial.print(dt.minute);
+  Serial.print(":");
+  Serial.println(dt.second);
+  Serial.println(dt.second);
   
   // Initialize pins
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(WATER_SENSOR_PIN, INPUT);
-  
-  // Initialize DHT sensor
-  dht.begin();
   
   // Initialize stepper motor
   stepper.setSpeed(STEPPER_SPEED);  // Set RPM
@@ -153,17 +202,41 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
   
-  // Read sensors periodically
+  // IMPORTANT: Call DHT measure() EVERY loop for non-blocking to work!
+  float newTemp, newHum;
+  if (dht.measure(&newTemp, &newHum)) {
+    // Reading successful!
+    temperature = newTemp;
+    humidity = newHum;
+    dhtWorking = true;
+    Serial.print("DHT OK - ");
+    Serial.print(temperature);
+    Serial.print("C, ");
+    Serial.print(humidity);
+    Serial.println("%");
+  }
+  
+  // Read touch sensor every loop
+  int sensorValue = analogRead(WATER_SENSOR_PIN);
+  touchDetected = (sensorValue > TOUCH_THRESHOLD);
+  
+  // Check warnings periodically
   if (currentTime - lastWarningCheck >= WARNING_CHECK_INTERVAL) {
-    updateSensors();
     checkWarningConditions();
+    updateNextMedTime();
     lastWarningCheck = currentTime;
   }
   
   // Cycle display between temp/humidity and date
   if (currentTime - lastDisplayCycle >= DISPLAY_CYCLE_INTERVAL) {
-    showDate = !showDate;  // Toggle display
+    showDate = !showDate;
     lastDisplayCycle = currentTime;
+  }
+  
+  // Check if it's time for medication
+  if (currentTime - lastMedicationCheck >= MEDICATION_CHECK_INTERVAL) {
+    checkMedicationTime();
+    lastMedicationCheck = currentTime;
   }
   
   // Update display
@@ -186,40 +259,7 @@ void loop() {
     }
   }
   
-  delay(50);  // Small delay to prevent overwhelming the system
-}
-
-// ==================== SENSOR FUNCTIONS ====================
-void updateSensors() {
-  // Read temperature and humidity from DHT11
-  float newTemp = dht.readTemperature();
-  float newHum = dht.readHumidity();
-  
-  // Check if readings are valid
-  if (!isnan(newTemp) && !isnan(newHum)) {
-    temperature = newTemp;
-    humidity = newHum;
-    dhtWorking = true;
-    
-    Serial.print("DHT OK - Temp: ");
-    Serial.print(temperature);
-    Serial.print("°C, Humidity: ");
-    Serial.print(humidity);
-    Serial.println("%");
-  } else {
-    // DHT reading failed, keep previous values
-    dhtWorking = false;
-    Serial.println("DHT read failed - using defaults");
-  }
-  
-  // Read water sensor (touch detection)
-  int sensorValue = analogRead(WATER_SENSOR_PIN);
-  touchDetected = (sensorValue > TOUCH_THRESHOLD);
-  
-  if (touchDetected) {
-    Serial.print("Touch detected! Value: ");
-    Serial.println(sensorValue);
-  }
+  delay(50);
 }
 
 void checkWarningConditions() {
@@ -391,29 +431,53 @@ void dispensePill() {
 }
 
 // ==================== RTC FUNCTIONS ====================
-void setTimeFromSerial() {
-  // Expected format: TYYYYMMDDHHMMSS
-  // Example: T20260329123045 = 2026-03-29 12:30:45
-  if (Serial.available() >= 14) {
-    String timeStr = Serial.readStringUntil('\n');
+
+// Check if current time matches any medication time
+void checkMedicationTime() {
+  RTCDateTime dt = rtc.getDateTime();
+  int currentHour = dt.hour;
+  int currentMinute = dt.minute;
+  
+  Serial.print("Checking meds at ");
+  Serial.print(currentHour);
+  Serial.print(":");
+  Serial.println(currentMinute);
+  
+  // Check each medication time
+  for (int i = 0; i < NUM_MED_TIMES; i++) {
+    int medHour = (int)MED_TIMES[i];
+    float decimalPart = MED_TIMES[i] - medHour;
+    int medMinute = (int)(decimalPart * 60);
     
-    uint16_t year = timeStr.substring(0, 4).toInt();
-    uint8_t month = timeStr.substring(4, 6).toInt();
-    uint8_t day = timeStr.substring(6, 8).toInt();
-    uint8_t hour = timeStr.substring(8, 10).toInt();
-    uint8_t minute = timeStr.substring(10, 12).toInt();
-    uint8_t second = timeStr.substring(12, 14).toInt();
-    
-    rtc.setDateTime(year, month, day, hour, minute, second);
-    
-    Serial.println("Time set successfully!");
-    lcd.clear();
-    lcd.print("Time Updated!");
-    delay(1000);
+    // Check if we're within the medication time window (same hour, within 1 minute)
+    if (currentHour == medHour && abs(currentMinute - medMinute) <= 1) {
+      // Check if this medication hasn't been dispensed yet today
+      if (!medicationDispensed[i]) {
+        Serial.print("*** MEDICATION TIME! *** Dispensing for time slot ");
+        Serial.print(i);
+        Serial.print(" (");
+        Serial.print(medHour);
+        Serial.print(":");
+        Serial.print(medMinute);
+        Serial.println(")");
+        
+        dispensePill();
+        medicationDispensed[i] = true;  // Mark as dispensed
+        return;  // Only dispense once per check
+      }
+    }
+  }
+  
+  // Reset dispensed flags at midnight (new day)
+  static int lastDay = -1;
+  if (dt.day != lastDay) {
+    for (int i = 0; i < 8; i++) {
+      medicationDispensed[i] = false;
+    }
+    lastDay = dt.day;
+    Serial.println("New day - reset medication tracking");
   }
 }
-
-// ==================== UTILITY FUNCTIONS ====================
 
 // Calculate next medication time based on current time
 void updateNextMedTime() {
